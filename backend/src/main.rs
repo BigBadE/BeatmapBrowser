@@ -1,71 +1,69 @@
-mod database;
-mod body;
-mod search;
+mod api;
+mod discord;
+mod parsing;
+mod util;
 
-use crate::body::EitherBody;
-use crate::database::connect;
-use crate::search::search_database;
-use http_body_util::Full;
-use hyper::body::Bytes;
-use hyper::server::conn::http1;
-use hyper::service::service_fn;
-use hyper::{Request, Response};
-use hyper_staticfile::Static;
-use hyper_util::rt::TokioIo;
-use std::convert::Infallible;
+use crate::api::delete::delete;
+use crate::api::downloaded::{download, remove};
+use crate::api::search::search;
+use crate::api::signin::{discord_signin, discord_sync, google_signin, google_sync};
+use crate::api::upload::upload;
+use crate::api::upvote::{unvote, upvote};
+use crate::api::usersongs::usersongs;
+use crate::discord::run_bot;
+use crate::util::amazon::Amazon;
+use crate::util::database::User;
+use crate::util::ratelimiter::{Ratelimiter, SiteAction};
+use crate::util::warp::{check_ratelimit, extract_identifier, extract_map, handle_auth, handle_error, Replyable};
+use firebase_auth::FirebaseAuth;
 use std::net::SocketAddr;
-use std::path::Path;
-use surrealdb::engine::remote::ws::Client;
-use surrealdb::Surreal;
-use tokio::net::TcpListener;
+use std::sync::{Arc, Mutex};
+use warp::path::param;
+use warp::{get, multipart, path, post, Filter};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let site = Static::new(Path::new("backend/site/"));
-    let db = connect().await?;
+    println!("Starting version {}", env!("CARGO_PKG_VERSION"));
 
-    let addr: SocketAddr = ([127, 0, 0, 1], 3000).into();
-    let listener = TcpListener::bind(addr)
-        .await
-        .expect("Failed to create TCP listener");
-    eprintln!("Server running on https://{}/", addr);
-    loop {
-        let (stream, _) = listener
-            .accept()
-            .await
-            .expect("Failed to accept TCP connection");
+    let _site = std::env::args().nth(2).unwrap();
 
-        let site = site.clone();
-        let db = db.clone();
-        tokio::spawn(async move {
-            if let Err(err) = http1::Builder::new()
-                .serve_connection(
-                    TokioIo::new(stream),
-                    service_fn(move |req| handle_request(req, site.clone(), db.clone())),
-                )
-                .await
-            {
-                eprintln!("Error serving connection: {:?}", err);
-            }
-        });
-    }
+    let _ = tokio::spawn(run_bot());
+
+    let limit = |action, in_path: &'static str| path("api").and(path(in_path)).and(check_ratelimit(action)).untuple_one();
+    let limit_param = |action, path| limit(action, path).and(get()).and(param::<String>());
+    let auth = |action, path| limit(action, path).and(post()).and(handle_auth());
+    let auth_map = |action, path| limit(action, path).and(post()).and(extract_map()).untuple_one();
+
+    warp::serve(
+        auth(SiteAction::UpvoteList, "account_data")
+            .map(|user: User| user.reply())
+            .or(auth_map(SiteAction::Search, "delete").and_then(delete))
+            .or(auth_map(SiteAction::Download, "download").and_then(download))
+            .or(auth_map(SiteAction::Download, "remove").and_then(remove))
+            .or(limit_param(SiteAction::Search, "search").and_then(search))
+            .or(auth_map(SiteAction::Search, "upvote").and_then(upvote))
+            .or(auth_map(SiteAction::Search, "unvote").and_then(unvote))
+            .or(limit(SiteAction::Search, "upload")
+                .and(post())
+                .and(extract_identifier())
+                .and(multipart::form())
+                .and_then(upload))
+            .or(limit_param(SiteAction::Search, "usersongs").and_then(usersongs))
+            .or(limit_param(SiteAction::UpvoteList, "discordauth").and_then(discord_signin))
+            .or(auth(SiteAction::UpvoteList, "discordsync").and(param()).and_then(discord_sync))
+            .or(limit_param(SiteAction::UpvoteList, "googleauth").and_then(google_signin))
+            .or(auth(SiteAction::UpvoteList, "googlesync").and(param()).and_then(google_sync))
+            .or(warp::fs::dir(std::env::args().nth(2).unwrap()))
+            .recover(handle_error),
+    )
+    .run(std::env::args().nth(1).unwrap().parse::<SocketAddr>().unwrap())
+    .await;
+    Ok(())
 }
 
-async fn handle_request(request: Request<hyper::body::Incoming>, site: Static, db: Surreal<Client>) -> Result<Response<EitherBody>, Infallible> {
-    Ok(match request.uri().path() {
-        "/api/search" => {
-            let maps = match search_database(request.uri().query().unwrap_or(""), db).await {
-                Ok(maps) => maps,
-                Err(error) => {
-                    println!("Error: {:?}", error);
-                    return Ok(Response::builder().status(error.get_code())
-                        .body(Full::new(Bytes::from(error.to_string())).into()).expect("Failed to make error response"))
-                }
-            };
-
-            Response::new(Full::new(Bytes::from(serde_json::to_string(&maps).expect("Failed to serialize maps"))).into())
-        }
-        // Default to static files
-        _ => site.serve(request).await.expect("Failed to serve static file").map(|body| body.into()),
-    })
+#[derive(Clone)]
+pub struct SiteData {
+    auth: FirebaseAuth,
+    amazon: Amazon,
+    ratelimiter: Arc<Mutex<Ratelimiter>>,
 }

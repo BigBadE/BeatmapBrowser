@@ -1,3 +1,11 @@
 [workspace]
+members = [
+    "backend",
+    "oneclick",
+    "transfer"
+]
 resolver = "2"
-members = ["backend", "scraper"]
+
+# Enable max optimizations for dependencies, but not for our code:
+[profile.dev.package."*"]
+opt-level = 3

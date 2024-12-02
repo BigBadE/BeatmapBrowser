@@ -1,0 +1,45 @@
+name: Build and Deploy to Heroku
+
+env:
+  HEROKU_API_KEY: ${{ secrets.HEROKU_API_KEY }}
+  HEROKU_EMAIL: ${{ secrets.HEROKU_EMAIL }}
+
+on:
+  push:
+    branches:
+      - testing # Adjust to the branch you want to trigger the deployment
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          submodules: 'true'
+      #- name: Write all secrets to config.config
+      #  run: |
+          # Save the JSON string of secrets to a file
+      #    echo '${{ toJSON(secrets) }}' > secrets.json
+      
+          # Parse the JSON and write each key-value pair to config.config
+      #    jq -r 'to_entries | .[] | "\(.key)=\"\(.value)\""' secrets.json > config/config.config
+      - name: Log in to Heroku Container Registry
+        run: |
+          echo "$HEROKU_API_KEY" | docker login --username="$HEROKU_EMAIL" --password-stdin registry.heroku.com
+
+      - name: Build Docker image
+        run: |
+          docker build -t registry.heroku.com/${{ secrets.HEROKU_APP_NAME }}/web .
+
+      - name: Push Docker image to Heroku
+        run: |
+          docker push registry.heroku.com/${{ secrets.HEROKU_APP_NAME }}/web
+
+      - name: Release the image
+        run: |
+          heroku container:push web --app ${{ secrets.HEROKU_APP_NAME }} && 
+          heroku container:release web --app ${{ secrets.HEROKU_APP_NAME }}
+        env:
+          HEROKU_API_KEY: ${{ secrets.HEROKU_API_KEY }}

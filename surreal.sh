@@ -1,1 +1,0 @@
-surreal start "rocksdb://C:/Program Files/SurrealDB/db"
